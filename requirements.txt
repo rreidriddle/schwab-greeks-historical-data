@@ -1,0 +1,7 @@
+python-dotenv
+requests
+numpy
+scipy
+pandas
+matplotlib
+zoneinfo; python_version < "3.9"

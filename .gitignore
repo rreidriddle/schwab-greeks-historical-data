@@ -1,0 +1,31 @@
+# Credentials
+.env
+.env.*
+
+# Database — never commit your collected data
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+collector.log
+
+# Tokens
+tokens.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Screenshots / generated images
+*.png
+*.jpg
