@@ -387,10 +387,11 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
         "CharmEX", "CharmEX_call", "CharmEX_put",
         "oi", "volume",
     ]
-    a = (df.groupby(["strike", "dte_bucket"])[cols]
+    # Group by strike AND dte so each expiration row keeps its dte value
+    a = (df.groupby(["strike", "dte", "dte_bucket"])[cols]
            .sum()
            .reset_index()
-           .sort_values("strike"))
+           .sort_values(["strike", "dte"]))
     a["GEX_net"] = a["GEX_call"] + a["GEX_put"]
     return a
 
@@ -463,7 +464,7 @@ def write_strike_data(conn: sqlite3.Connection, ts: str,
     for _, r in agg.iterrows():
         rows.append((
             ts, symbol, spot,
-            r["strike"], r["dte_bucket"],
+            r["strike"], r["dte"], r["dte_bucket"],
             r.get("GEX_call"),  r.get("GEX_put"),  r.get("GEX_net"),
             r.get("VannEX_call"), r.get("VannEX_put"), r.get("VannEX"),
             r.get("CharmEX_call"), r.get("CharmEX_put"), r.get("CharmEX"),
@@ -472,12 +473,12 @@ def write_strike_data(conn: sqlite3.Connection, ts: str,
 
     conn.executemany("""
         INSERT INTO strike_data (
-            timestamp, symbol, spot, strike, dte_bucket,
+            timestamp, symbol, spot, strike, dte, dte_bucket,
             GEX_call, GEX_put, GEX_net,
             VannEX_call, VannEX_put, VannEX_net,
             CharmEX_call, CharmEX_put, CharmEX_net,
             total_oi, total_volume
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, rows)
     conn.commit()
 
@@ -529,7 +530,7 @@ def write_summary(conn: sqlite3.Connection, ts: str,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_pull(conn: sqlite3.Connection, token: str):
-    ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     log.info(f"Pull started — {ts}")
 
     for symbol in SYMBOLS:
@@ -593,7 +594,7 @@ def main():
             hrs  = secs // 3600
             mins = (secs % 3600) // 60
             log.info(f"Market closed — sleeping {hrs}h {mins}m until next open")
-            time.sleep(min(secs, 3600))  # wake up at least hourly to re-check
+            time.sleep(60)  # check every minute so we catch market open precisely
             continue
 
         # Refresh token before each pull cycle
