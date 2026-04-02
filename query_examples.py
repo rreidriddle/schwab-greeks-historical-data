@@ -10,7 +10,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 
-DB_PATH = "greeks_history.db"  # update if on NVMe
+DB_PATH = "D:/GreeksData/greeks_history.db"
 
 conn = sqlite3.connect(DB_PATH)
 
