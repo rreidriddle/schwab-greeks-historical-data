@@ -3,6 +3,10 @@ auth.py — Schwab OAuth2 Authentication Module
 =============================================
 Handles the full 3-legged OAuth2 flow for the Charles Schwab API.
 
+Shared by options_greeks_dashboard.py and collector.py — place all three
+files in the same folder. A file lock prevents race conditions when both
+programs try to refresh the access token at the same time.
+
 First run:
   - Opens your browser to Schwab's login page
   - You log in with your Schwab BROKERAGE credentials (not developer portal)
@@ -30,9 +34,54 @@ CLIENT_ID     = os.environ.get("SCHWAB_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("SCHWAB_CLIENT_SECRET")
 REDIRECT_URI  = os.environ.get("SCHWAB_REDIRECT_URI", "https://127.0.0.1")
 TOKENS_FILE   = "tokens.json"
+LOCK_FILE     = "tokens.lock"
 
 AUTH_URL      = "https://api.schwabapi.com/v1/oauth/authorize"
 TOKEN_URL     = "https://api.schwabapi.com/v1/oauth/token"
+
+# ── File lock (cross-platform) ─────────────────────────────────────────────────
+
+class _FileLock:
+    """
+    Simple cross-platform file lock using a lock file.
+    Prevents the dashboard and collector from refreshing tokens simultaneously.
+    """
+    def __init__(self, path: str, timeout: float = 15.0):
+        self.path    = path
+        self.timeout = timeout
+        self._fd     = None
+
+    def acquire(self):
+        deadline = time.time() + self.timeout
+        while time.time() < deadline:
+            try:
+                # O_CREAT | O_EXCL is atomic — only one process succeeds
+                self._fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                return
+            except FileExistsError:
+                time.sleep(0.1)
+        raise TimeoutError(f"Could not acquire token lock within {self.timeout}s")
+
+    def release(self):
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            finally:
+                self._fd = None
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -46,7 +95,6 @@ def _save_tokens(token_data: dict):
     token_data["saved_at"] = time.time()
     with open(TOKENS_FILE, "w") as f:
         json.dump(token_data, f, indent=2)
-    print(f"Tokens saved to {TOKENS_FILE}")
 
 
 def _load_tokens() -> dict | None:
@@ -64,8 +112,8 @@ def _is_access_token_expired(tokens: dict) -> bool:
 
 
 def _is_refresh_token_expired(tokens: dict) -> bool:
-    saved_at   = tokens.get("saved_at", 0)
-    elapsed    = time.time() - saved_at
+    saved_at = tokens.get("saved_at", 0)
+    elapsed  = time.time() - saved_at
     return elapsed >= (604800 - 3600)
 
 
@@ -115,45 +163,54 @@ def refresh_access_token(refresh_token: str) -> dict:
         raise Exception("Failed to refresh access token. Re-run login flow.")
     tokens = resp.json()
     _save_tokens(tokens)
-    print("Access token refreshed successfully.")
     return tokens
 
 
-def get_valid_access_token(silent=False) -> str:
+def get_valid_access_token(silent: bool = False) -> str:
     """
-    Returns a valid access token. 
-    If silent=True, suppresses print statements (useful for background threads).
+    Returns a valid access token.
+    Uses a file lock so the dashboard and collector can't refresh simultaneously.
+    If silent=True, suppresses print statements (used by background threads).
     """
     if not CLIENT_ID or not CLIENT_SECRET:
-        raise EnvironmentError("SCHWAB_CLIENT_ID or SCHWAB_CLIENT_SECRET not found in .env")
+        raise EnvironmentError(
+            "SCHWAB_CLIENT_ID or SCHWAB_CLIENT_SECRET not found in .env"
+        )
 
-    tokens = _load_tokens()
+    with _FileLock(LOCK_FILE):
+        tokens = _load_tokens()
 
-    if tokens:
-        # Check if refresh token is dead (7 days)
-        if _is_refresh_token_expired(tokens):
-            if not silent: print("Refresh token expired (>7 days). Re-authenticating...")
-            return _run_login_flow()
-            
-        # Check if access token is still good (30 mins)
-        if not _is_access_token_expired(tokens):
+        if tokens:
+            # Refresh token dead (>7 days) — full re-auth required
+            if _is_refresh_token_expired(tokens):
+                if not silent:
+                    print("Refresh token expired (>7 days). Re-authenticating...")
+                return _run_login_flow()
+
+            # Access token still valid
+            if not _is_access_token_expired(tokens):
+                if not silent:
+                    expiry = tokens.get("saved_at", 0) + tokens.get("expires_in", 1800)
+                    mins   = int((expiry - time.time()) / 60)
+                    print(f"Access token valid — expires in ~{mins} minutes.")
+                return tokens["access_token"]
+
+            # Access token expired — refresh silently
             if not silent:
-                expiry = tokens.get("saved_at", 0) + tokens.get("expires_in", 1800)
-                mins = int((expiry - time.time()) / 60)
-                print(f"Access token valid — expires in ~{mins} minutes.")
-            return tokens["access_token"]
-            
-        # Access token expired, but refresh token is still good
-        if not silent: print("Access token expired — refreshing...")
-        try:
-            new_tokens = refresh_access_token(tokens["refresh_token"])
-            return new_tokens["access_token"]
-        except Exception as e:
-            if not silent: print(f"Refresh failed: {e}")
-            return _run_login_flow()
+                print("Access token expired — refreshing...")
+            try:
+                new_tokens = refresh_access_token(tokens["refresh_token"])
+                if not silent:
+                    print("Access token refreshed successfully.")
+                return new_tokens["access_token"]
+            except Exception as e:
+                if not silent:
+                    print(f"Refresh failed: {e}")
+                return _run_login_flow()
 
-    if not silent: print("No tokens found — starting login flow...")
-    return _run_login_flow()
+        if not silent:
+            print("No tokens found — starting login flow...")
+        return _run_login_flow()
 
 
 def _run_login_flow() -> str:
@@ -179,7 +236,9 @@ def _run_login_flow() -> str:
         print(f"Manually open this URL:\n  {auth_url}\n")
 
     print()
-    redirected_url = input("  Paste the full redirect URL here and press Enter:\n  > ").strip()
+    redirected_url = input(
+        "  Paste the full redirect URL here and press Enter:\n  > "
+    ).strip()
 
     try:
         from urllib.parse import urlparse, parse_qs, unquote
@@ -192,7 +251,7 @@ def _run_login_flow() -> str:
             "Make sure you pasted the complete redirect URL."
         )
 
-    print(f"Authorization code extracted.")
+    print("Authorization code extracted.")
     print("Exchanging code for tokens...\n")
 
     tokens = exchange_code_for_tokens(auth_code)
@@ -211,6 +270,5 @@ if __name__ == "__main__":
         token = get_valid_access_token()
         print(f"Got access token: {token[:20]}...{token[-10:]}")
         print("\nAuthentication working correctly.")
-        print("You can now run options_greeks_analyzer.py")
     except Exception as e:
         print(f"Authentication failed: {e}")

@@ -29,3 +29,8 @@ Thumbs.db
 # Screenshots / generated images
 *.png
 *.jpg
+
+data/
+
+gex-dashboard.py
+

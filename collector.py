@@ -9,6 +9,9 @@ Stores per-strike Greeks and summary data in SQLite for backtesting.
 Symbols: SPY, QQQ, DIA, XSP, IWM
 Greeks:  Gamma (GEX), Vanna, Charm
 Storage: Two tables — strike_data (granular) + summary (top-level)
+
+Place in the same folder as auth.py and options_greeks_dashboard.py.
+All three programs share a single tokens.json via the file-locked auth module.
 """
 
 from dotenv import load_dotenv
@@ -25,6 +28,7 @@ import numpy as np
 import pandas as pd
 from zoneinfo import ZoneInfo
 from scipy.stats import norm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -49,13 +53,15 @@ DTE_BUCKETS = [
     (181, 999, "180+DTE"),
 ]
 
-# ── Storage path — point this at your NVMe drive ───────────────────────────
+# Storage path — point this at your NVMe drive if desired
 # Windows example: "D:/GreeksData/greeks_history.db"
-# Default: saves in the project folder
 DB_PATH = os.environ.get("GREEKS_DB_PATH", "greeks_history.db")
 
 # Pull interval in minutes
 PULL_INTERVAL_MINUTES = 15
+
+# Max parallel workers for concurrent symbol fetching
+MAX_WORKERS = 3
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -77,67 +83,50 @@ log = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def init_db(path: str) -> sqlite3.Connection:
-    """
-    Create SQLite database and tables if they don't exist.
-    Returns open connection.
-    """
-    # Auto-create directory if it doesn't exist (important for NVMe path)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-
     conn = sqlite3.connect(path, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")   # faster writes
-    conn.execute("PRAGMA synchronous=NORMAL") # safe but faster than FULL
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
 
     conn.executescript("""
-    -- ── Per-strike detail table ──────────────────────────────────────────
     CREATE TABLE IF NOT EXISTS strike_data (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp       TEXT    NOT NULL,   -- ISO8601 UTC
+        timestamp       TEXT    NOT NULL,
         symbol          TEXT    NOT NULL,
         spot            REAL    NOT NULL,
         strike          REAL    NOT NULL,
         dte             REAL    NOT NULL,
-        dte_bucket      TEXT    NOT NULL,   -- "0DTE", "1-7DTE", etc.
-        -- Gamma
+        dte_bucket      TEXT    NOT NULL,
         GEX_call        REAL,
         GEX_put         REAL,
         GEX_net         REAL,
-        -- Vanna
         VannEX_call     REAL,
         VannEX_put      REAL,
         VannEX_net      REAL,
-        -- Charm
         CharmEX_call    REAL,
         CharmEX_put     REAL,
         CharmEX_net     REAL,
-        -- Volume & OI
         total_oi        INTEGER,
         total_volume    INTEGER,
-        -- Vol
         iv_call         REAL,
         iv_put          REAL
     );
 
-    -- ── Top-level summary table ───────────────────────────────────────────
     CREATE TABLE IF NOT EXISTS summary (
         id                  INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp           TEXT    NOT NULL,
         symbol              TEXT    NOT NULL,
         spot                REAL    NOT NULL,
-        -- Net exposures (all strikes summed)
         net_GEX             REAL,
         net_VannEX          REAL,
         net_CharmEX         REAL,
-        -- Key structural levels
-        gamma_flip          REAL,   -- strike where GEX crosses zero
-        call_wall           REAL,   -- strike with highest call GEX
-        put_wall            REAL,   -- strike with highest put GEX (most neg)
-        max_pain            REAL,   -- strike where most options expire worthless
-        -- Market context
+        gamma_flip          REAL,
+        call_wall           REAL,
+        put_wall            REAL,
+        max_pain            REAL,
         total_oi            INTEGER,
         total_volume        INTEGER,
-        iv_atm              REAL,   -- IV of closest ATM option
-        -- Per-bucket net GEX (for regime analysis)
+        iv_atm              REAL,
         gex_0dte            REAL,
         gex_1_7dte          REAL,
         gex_8_30dte         REAL,
@@ -146,7 +135,6 @@ def init_db(path: str) -> sqlite3.Connection:
         gex_180plus_dte     REAL
     );
 
-    -- ── Indexes for fast querying ─────────────────────────────────────────
     CREATE INDEX IF NOT EXISTS idx_strike_ts     ON strike_data (timestamp, symbol);
     CREATE INDEX IF NOT EXISTS idx_strike_sym    ON strike_data (symbol, strike);
     CREATE INDEX IF NOT EXISTS idx_strike_bucket ON strike_data (symbol, dte_bucket);
@@ -161,64 +149,49 @@ def init_db(path: str) -> sqlite3.Connection:
 # MARKET HOURS CHECK
 # ══════════════════════════════════════════════════════════════════════════════
 
-# US market holidays 2025-2026 (expand as needed)
 MARKET_HOLIDAYS = {
-    datetime.date(2025, 1,  1),   # New Year's Day
-    datetime.date(2025, 1, 20),   # MLK Day
-    datetime.date(2025, 2, 17),   # Presidents Day
-    datetime.date(2025, 4, 18),   # Good Friday
-    datetime.date(2025, 5, 26),   # Memorial Day
-    datetime.date(2025, 6, 19),   # Juneteenth
-    datetime.date(2025, 7,  4),   # Independence Day
-    datetime.date(2025, 9,  1),   # Labor Day
-    datetime.date(2025, 11, 27),  # Thanksgiving
-    datetime.date(2025, 12, 25),  # Christmas
-    datetime.date(2026, 1,  1),   # New Year's Day
-    datetime.date(2026, 1, 19),   # MLK Day
-    datetime.date(2026, 2, 16),   # Presidents Day
-    datetime.date(2026, 4,  3),   # Good Friday
-    datetime.date(2026, 5, 25),   # Memorial Day
-    datetime.date(2026, 6, 19),   # Juneteenth
-    datetime.date(2026, 7,  3),   # Independence Day (observed)
-    datetime.date(2026, 9,  7),   # Labor Day
-    datetime.date(2026, 11, 26),  # Thanksgiving
-    datetime.date(2026, 12, 25),  # Christmas
+    datetime.date(2025, 1,  1),
+    datetime.date(2025, 1, 20),
+    datetime.date(2025, 2, 17),
+    datetime.date(2025, 4, 18),
+    datetime.date(2025, 5, 26),
+    datetime.date(2025, 6, 19),
+    datetime.date(2025, 7,  4),
+    datetime.date(2025, 9,  1),
+    datetime.date(2025, 11, 27),
+    datetime.date(2025, 12, 25),
+    datetime.date(2026, 1,  1),
+    datetime.date(2026, 1, 19),
+    datetime.date(2026, 2, 16),
+    datetime.date(2026, 4,  3),
+    datetime.date(2026, 5, 25),
+    datetime.date(2026, 6, 19),
+    datetime.date(2026, 7,  3),
+    datetime.date(2026, 9,  7),
+    datetime.date(2026, 11, 26),
+    datetime.date(2026, 12, 25),
 }
 
 def is_market_open() -> bool:
-    """Return True if US equity market is currently open."""
     now   = datetime.datetime.now(ET)
     today = now.date()
-
-    # Weekend
     if now.weekday() >= 5:
         return False
-
-    # Holiday
     if today in MARKET_HOLIDAYS:
         return False
-
-    # Market hours: 9:30am – 4:00pm ET
     market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
     market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
-
     return market_open <= now < market_close
 
 
 def seconds_until_open() -> int:
-    """Return seconds until next market open."""
     now = datetime.datetime.now(ET)
-
-    # Try today first
     candidate = now.replace(hour=9, minute=30, second=0, microsecond=0)
     if candidate > now and now.weekday() < 5 and now.date() not in MARKET_HOLIDAYS:
         return int((candidate - now).total_seconds())
-
-    # Find next trading day
     next_day = now + datetime.timedelta(days=1)
     while next_day.weekday() >= 5 or next_day.date() in MARKET_HOLIDAYS:
         next_day += datetime.timedelta(days=1)
-
     next_open = next_day.replace(hour=9, minute=30, second=0, microsecond=0)
     return int((next_open - now).total_seconds())
 
@@ -227,7 +200,6 @@ def seconds_until_open() -> int:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_spot(token: str, symbol: str) -> float | None:
-    """Fetch current spot price from quotes endpoint."""
     try:
         r = requests.get(
             f"{SCHWAB_BASE}/quotes",
@@ -247,10 +219,6 @@ def get_spot(token: str, symbol: str) -> float | None:
 
 
 def get_options_chain(token: str, symbol: str, spot: float) -> dict | None:
-    """
-    Fetch options chain limited to 45 days forward.
-    NTM range keeps payload manageable for large-chain symbols like SPY.
-    """
     headers   = {"Authorization": f"Bearer {token}"}
     from_date = datetime.date.today().strftime("%Y-%m-%d")
     to_date   = (datetime.date.today() +
@@ -275,8 +243,8 @@ def get_options_chain(token: str, symbol: str, spot: float) -> dict | None:
             r.raise_for_status()
             return r.json()
         except requests.exceptions.HTTPError:
-            if r.status_code in [502, 503, 504] and attempt < 2:
-                w = (attempt + 1) * 5
+            if r.status_code in [429, 502, 503, 504] and attempt < 2:
+                w = (attempt + 1) * 3
                 log.warning(f"  {r.status_code} on {symbol} — retry in {w}s")
                 time.sleep(w)
                 continue
@@ -315,7 +283,7 @@ def get_dte_bucket(dte: float) -> str:
     return "180+DTE"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PARSE CHAIN → DATAFRAME
+# PARSE CHAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_chain(chain: dict, r: float = RISK_FREE) -> pd.DataFrame:
@@ -387,12 +355,22 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
         "CharmEX", "CharmEX_call", "CharmEX_put",
         "oi", "volume",
     ]
-    # Group by strike AND dte so each expiration row keeps its dte value
     a = (df.groupby(["strike", "dte", "dte_bucket"])[cols]
            .sum()
            .reset_index()
            .sort_values(["strike", "dte"]))
     a["GEX_net"] = a["GEX_call"] + a["GEX_put"]
+
+    iv_pivot = (df.pivot_table(
+                    index=["strike", "dte"],
+                    columns="type",
+                    values="iv",
+                    aggfunc="first")
+                  .reset_index()
+                  .rename(columns={"call": "iv_call", "put": "iv_put"}))
+    iv_pivot = iv_pivot[["strike", "dte"] +
+                        [c for c in ["iv_call", "iv_put"] if c in iv_pivot.columns]]
+    a = a.merge(iv_pivot, on=["strike", "dte"], how="left")
     return a
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -400,7 +378,6 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def calc_gamma_flip(agg: pd.DataFrame) -> float | None:
-    """Strike where net GEX crosses from positive to negative."""
     by_strike = agg.groupby("strike")["GEX_net"].sum().reset_index()
     pos = by_strike[by_strike["GEX_net"] > 0]["strike"]
     neg = by_strike[by_strike["GEX_net"] < 0]["strike"]
@@ -410,7 +387,6 @@ def calc_gamma_flip(agg: pd.DataFrame) -> float | None:
 
 
 def calc_call_wall(agg: pd.DataFrame) -> float | None:
-    """Strike with highest total call GEX."""
     by_strike = agg.groupby("strike")["GEX_call"].sum()
     if by_strike.empty:
         return None
@@ -418,7 +394,6 @@ def calc_call_wall(agg: pd.DataFrame) -> float | None:
 
 
 def calc_put_wall(agg: pd.DataFrame) -> float | None:
-    """Strike with most negative total put GEX."""
     by_strike = agg.groupby("strike")["GEX_put"].sum()
     if by_strike.empty:
         return None
@@ -426,27 +401,20 @@ def calc_put_wall(agg: pd.DataFrame) -> float | None:
 
 
 def calc_max_pain(df: pd.DataFrame) -> float | None:
-    """
-    Strike where total dollar value of expiring options is minimized.
-    Classic max pain: sum of (strike - K) * OI for all strikes.
-    """
     strikes = df["strike"].unique()
     if len(strikes) == 0:
         return None
-
     pain = {}
     for s in strikes:
-        calls = df[df["type"] == "call"]
-        puts  = df[df["type"] == "put"]
+        calls     = df[df["type"] == "call"]
+        puts      = df[df["type"] == "put"]
         call_pain = ((s - calls["strike"]).clip(lower=0) * calls["oi"]).sum()
         put_pain  = ((puts["strike"] - s).clip(lower=0) * puts["oi"]).sum()
         pain[s]   = call_pain + put_pain
-
     return float(min(pain, key=pain.get))
 
 
 def calc_atm_iv(df: pd.DataFrame, spot: float) -> float | None:
-    """IV of the option closest to ATM."""
     calls = df[df["type"] == "call"].copy()
     if calls.empty:
         return None
@@ -469,16 +437,17 @@ def write_strike_data(conn: sqlite3.Connection, ts: str,
             r.get("VannEX_call"), r.get("VannEX_put"), r.get("VannEX"),
             r.get("CharmEX_call"), r.get("CharmEX_put"), r.get("CharmEX"),
             int(r.get("oi", 0)), int(r.get("volume", 0)),
+            r.get("iv_call"), r.get("iv_put"),
         ))
-
     conn.executemany("""
         INSERT INTO strike_data (
             timestamp, symbol, spot, strike, dte, dte_bucket,
             GEX_call, GEX_put, GEX_net,
             VannEX_call, VannEX_put, VannEX_net,
             CharmEX_call, CharmEX_put, CharmEX_net,
-            total_oi, total_volume
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            total_oi, total_volume,
+            iv_call, iv_put
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, rows)
     conn.commit()
 
@@ -486,10 +455,6 @@ def write_strike_data(conn: sqlite3.Connection, ts: str,
 def write_summary(conn: sqlite3.Connection, ts: str,
                   symbol: str, spot: float,
                   agg: pd.DataFrame, df_raw: pd.DataFrame):
-
-    by_strike = agg.groupby("strike")["GEX_net"].sum()
-
-    # Per-bucket GEX
     bucket_gex = {}
     for _, label in [(lo, lbl) for lo, hi, lbl in DTE_BUCKETS]:
         subset = agg[agg["dte_bucket"] == label]["GEX_net"].sum()
@@ -526,6 +491,36 @@ def write_summary(conn: sqlite3.Connection, ts: str,
     conn.commit()
 
 # ══════════════════════════════════════════════════════════════════════════════
+# FETCH ONE SYMBOL (used by ThreadPoolExecutor)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch_symbol(token: str, symbol: str) -> tuple[str, float | None, pd.DataFrame | None]:
+    """
+    Fetch spot + chain for a single symbol.
+    Returns (symbol, spot, df_raw) — spot/df_raw are None on failure.
+    A short sleep between quote and chain helps avoid back-to-back 429s
+    on the same symbol without adding unnecessary delay between symbols.
+    """
+    spot = get_spot(token, symbol)
+    if not spot:
+        log.warning(f"  Skipping {symbol} — no spot price")
+        return symbol, None, None
+
+    time.sleep(1)  # brief pause between quote and chain for same symbol
+
+    chain = get_options_chain(token, symbol, spot)
+    if not chain:
+        log.warning(f"  Skipping {symbol} — no chain data")
+        return symbol, spot, None
+
+    df_raw = parse_chain(chain)
+    if df_raw.empty:
+        log.warning(f"  Skipping {symbol} — empty parsed chain")
+        return symbol, spot, None
+
+    return symbol, spot, df_raw
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SINGLE PULL CYCLE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -533,27 +528,25 @@ def run_pull(conn: sqlite3.Connection, token: str):
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     log.info(f"Pull started — {ts}")
 
+    results = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_symbol, token, sym): sym for sym in SYMBOLS}
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                symbol, spot, df_raw = future.result()
+                results[symbol] = (spot, df_raw)
+            except Exception as e:
+                log.error(f"  Unexpected error fetching {sym}: {e}")
+                results[sym] = (None, None)
+
+    # Write results in deterministic order
     for symbol in SYMBOLS:
-        log.info(f"  {symbol}...")
-        time.sleep(4)  # pace requests to avoid rate limiting
-
-        spot = get_spot(token, symbol)
-        if not spot:
-            log.warning(f"  Skipping {symbol} — no spot price")
-            continue
-
-        chain = get_options_chain(token, symbol, spot)
-        if not chain:
-            log.warning(f"  Skipping {symbol} — no chain data")
-            continue
-
-        df_raw = parse_chain(chain)
-        if df_raw.empty:
-            log.warning(f"  Skipping {symbol} — empty parsed chain")
+        spot, df_raw = results.get(symbol, (None, None))
+        if spot is None or df_raw is None:
             continue
 
         agg = aggregate(df_raw)
-
         write_strike_data(conn, ts, symbol, spot, agg)
         write_summary(conn, ts, symbol, spot, agg, df_raw)
 
@@ -566,13 +559,18 @@ def run_pull(conn: sqlite3.Connection, token: str):
                  f"Charm {net_charm/1e6:+.4f}M | "
                  f"OI {agg['oi'].sum():,.0f}")
 
-    log.info(f"Pull complete — {len(SYMBOLS)} symbols stored\n")
+    log.info(f"Pull complete — {len(SYMBOLS)} symbols\n")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+
+    import ctypes
+    ES_CONTINUOUS      = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
     if CLIENT_ID == "YOUR_CLIENT_ID":
         log.error("No Schwab credentials found. Add to .env file.")
         sys.exit(1)
@@ -588,28 +586,34 @@ def main():
 
     from auth import get_valid_access_token
 
-    while True:
-        if not is_market_open():
-            secs = seconds_until_open()
-            hrs  = secs // 3600
-            mins = (secs % 3600) // 60
-            log.info(f"Market closed — sleeping {hrs}h {mins}m until next open")
-            time.sleep(60)  # check every minute so we catch market open precisely
-            continue
+    try:
+        while True:
+            if not is_market_open():
+                secs = seconds_until_open()
+                hrs  = secs // 3600
+                mins = (secs % 3600) // 60
+                log.info(f"Market closed — sleeping {hrs}h {mins}m until next open")
+                time.sleep(60)
+                continue
 
-        # Refresh token before each pull cycle
-        try:
-            token = get_valid_access_token()
-        except Exception as e:
-            log.error(f"Auth failed: {e}")
-            time.sleep(60)
-            continue
+            try:
+                token = get_valid_access_token(silent=True)
+            except Exception as e:
+                log.error(f"Auth failed: {e}")
+                time.sleep(60)
+                continue
 
-        run_pull(conn, token)
+            run_pull(conn, token)
 
-        # Sleep until next pull
-        log.info(f"Next pull in {PULL_INTERVAL_MINUTES} minutes...")
-        time.sleep(PULL_INTERVAL_MINUTES * 60)
+            log.info(f"Next pull in {PULL_INTERVAL_MINUTES} minutes...")
+            time.sleep(PULL_INTERVAL_MINUTES * 60)
+
+    except KeyboardInterrupt:
+        log.info("Collector stopped by user.")
+    finally:
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        log.info("Sleep prevention cleared.")
+
 
 
 if __name__ == "__main__":
