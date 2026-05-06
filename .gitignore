@@ -33,4 +33,5 @@ Thumbs.db
 data/
 
 gex-dashboard.py
-
+dashboard.png
+dashboard_config.json
