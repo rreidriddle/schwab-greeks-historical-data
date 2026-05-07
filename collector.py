@@ -9,8 +9,8 @@ Changes from v1:
   - 10-minute pull interval (was 15)
   - Guaranteed scheduled pulls at 3:45 PM and 4:00 PM ET
   - Fixed IV null bug in write_strike_data()
-  - Macro data collection integrated (TLT, USO, VIX, TNX, TYX)
-  - Yield curve fetched from Treasury.gov once per session morning
+  - Macro data collection integrated (TLT, USO, VIX, TNX, TYX, FVX, IRX)
+  - Yield curve fetched from Treasury.gov on startup + once per session
   - Macro regime + combined signal computed and stored each pull
 """
 
@@ -74,7 +74,7 @@ REGIME_THRESHOLDS = {
 
 TREASURY_XML_URL = (
     "https://home.treasury.gov/resource-center/data-chart-center/"
-    "interest-rates/pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value="
+    "interest-rates/pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value_month="
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -160,6 +160,8 @@ def init_db(path: str) -> sqlite3.Connection:
         uso_chg_pct  REAL,
         tnx_yield    REAL,
         tyx_yield    REAL,
+        fvx_yield    REAL,
+        irx_yield    REAL,
         vix          REAL,
         vix_change   REAL,
         vix_chg_pct  REAL,
@@ -192,6 +194,16 @@ def init_db(path: str) -> sqlite3.Connection:
     CREATE UNIQUE INDEX IF NOT EXISTS idx_yield_date ON yield_curve (date);
     """)
     conn.commit()
+
+    # Migrate existing DBs that predate fvx_yield / irx_yield columns
+    for col in ("fvx_yield", "irx_yield"):
+        try:
+            conn.execute(f"ALTER TABLE macro_snapshot ADD COLUMN {col} REAL")
+            conn.commit()
+            log.info(f"  Migration: added {col} column to macro_snapshot")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
     log.info(f"Database ready: {path}")
     return conn
 
@@ -326,15 +338,16 @@ def get_options_chain(token: str, symbol: str, spot: float) -> dict | None:
 
 def get_macro_quotes(token: str) -> dict:
     """
-    Fetch TLT, USO, $VIX, $TNX, $TYX in a single quotes call.
+    Fetch TLT, USO, $VIX, $TNX, $TYX, $FVX, $IRX in a single quotes call.
     Returns dict with all macro values. Any failed field returns None.
     """
-    symbols = ["TLT", "USO", "$VIX", "$TNX", "$TYX"]
+    symbols = ["TLT", "USO", "$VIX", "$TNX", "$TYX", "$FVX", "$IRX"]
     result  = {
         "tlt_price": None, "tlt_change": None, "tlt_chg_pct": None,
         "uso_price": None, "uso_change": None, "uso_chg_pct": None,
         "vix":       None, "vix_change": None, "vix_chg_pct": None,
         "tnx_yield": None, "tyx_yield":  None,
+        "fvx_yield": None, "irx_yield":  None,
     }
     try:
         r = requests.get(
@@ -368,7 +381,12 @@ def get_macro_quotes(token: str) -> dict:
         })
 
         # Index yields — Schwab returns as x10 (e.g. 44.4 = 4.44%)
-        for key, sym in [("tnx_yield", "$TNX"), ("tyx_yield", "$TYX")]:
+        for key, sym in [
+            ("tnx_yield", "$TNX"),
+            ("tyx_yield", "$TYX"),
+            ("fvx_yield", "$FVX"),
+            ("irx_yield", "$IRX"),
+        ]:
             inner = qd.get(sym, {})
             quote = inner.get("quote", inner)
             raw   = quote.get("lastPrice") or quote.get("mark")
@@ -459,40 +477,29 @@ def build_combined_signal(macro_regime: str, gex_regime: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_yield_curve(target_date: datetime.date | None = None) -> dict | None:
-    """
-    Fetch daily Treasury yield curve from Treasury.gov XML feed.
-    Tries current month first, walks back up to 5 days for latest available.
-    """
     base_date = target_date or datetime.date.today()
-    for offset in range(5):
-        d         = base_date - datetime.timedelta(days=offset)
-        month_str = d.strftime("%Y%m")
-        url       = TREASURY_XML_URL + month_str
+    months_to_try = [
+        base_date.strftime("%Y%m"),
+        (base_date.replace(day=1) - datetime.timedelta(days=1)).strftime("%Y%m"),
+    ]
+    for month_str in months_to_try:
+        url = TREASURY_XML_URL + month_str
         try:
             r = requests.get(url, timeout=20)
             r.raise_for_status()
             root = ElementTree.fromstring(r.content)
-
             ns = {
                 "m":    "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata",
                 "d":    "http://schemas.microsoft.com/ado/2007/08/dataservices",
                 "atom": "http://www.w3.org/2005/Atom",
             }
-
             entries = root.findall("atom:entry/atom:content/m:properties", ns)
             if not entries:
                 continue
 
-            target_str = d.strftime("%Y-%m-%d")
-            best       = None
-            for entry in entries:
-                date_el = entry.find("d:NEW_DATE", ns)
-                if date_el is not None and date_el.text:
-                    if date_el.text[:10] == target_str:
-                        best = entry
-                        break
-            if best is None:
-                best = entries[0]
+            best = entries[-1]  # Treasury returns oldest first, newest last
+            date_el = best.find("d:NEW_DATE", ns)
+            actual_date = date_el.text[:10] if (date_el is not None and date_el.text) else base_date.isoformat()
 
             def _val(tag):
                 el = best.find(f"d:{tag}", ns)
@@ -514,15 +521,15 @@ def fetch_yield_curve(target_date: datetime.date | None = None) -> dict | None:
             spread_10_2  = round(y10 - y2,  4) if (y10 and y2)  else None
             spread_10_3m = round(y10 - m3,  4) if (y10 and m3)  else None
 
-            log.info(f"  Yield curve: 2Y={y2}% 10Y={y10}% 30Y={y30}%")
+            log.info(f"  Yield curve ({actual_date}): 2Y={y2}% 10Y={y10}% 30Y={y30}%")
             return {
-                "date": d.isoformat(),
+                "date": actual_date,
                 "m3": m3, "m6": m6, "y1": y1, "y2": y2,
                 "y5": y5, "y7": y7, "y10": y10, "y20": y20, "y30": y30,
                 "spread_10_2": spread_10_2, "spread_10_3m": spread_10_3m,
             }
         except Exception as e:
-            log.warning(f"  Yield curve fetch failed (offset {offset}): {e}")
+            log.warning(f"  Yield curve fetch failed ({month_str}): {e}")
             continue
     return None
 
@@ -628,7 +635,7 @@ def parse_chain(chain: dict, r: float = RISK_FREE) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AGGREGATE  (IV fix applied here)
+# AGGREGATE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def aggregate(df: pd.DataFrame) -> pd.DataFrame:
@@ -644,7 +651,6 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
            .sort_values(["strike", "dte"]))
     a["GEX_net"] = a["GEX_call"] + a["GEX_put"]
 
-    # IV fix — pivot before merge to preserve call/put IV correctly
     iv_pivot = (df.pivot_table(
                     index=["strike", "dte"],
                     columns="type",
@@ -800,15 +806,16 @@ def write_macro_snapshot(conn: sqlite3.Connection, ts: str,
             timestamp,
             tlt_price, tlt_change, tlt_chg_pct,
             uso_price, uso_change, uso_chg_pct,
-            tnx_yield, tyx_yield,
+            tnx_yield, tyx_yield, fvx_yield, irx_yield,
             vix, vix_change, vix_chg_pct,
             regime, signal
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         ts,
         macro.get("tlt_price"),  macro.get("tlt_change"),  macro.get("tlt_chg_pct"),
         macro.get("uso_price"),  macro.get("uso_change"),  macro.get("uso_chg_pct"),
         macro.get("tnx_yield"),  macro.get("tyx_yield"),
+        macro.get("fvx_yield"),  macro.get("irx_yield"),
         macro.get("vix"),        macro.get("vix_change"),  macro.get("vix_chg_pct"),
         regime, signal,
     ))
@@ -871,6 +878,8 @@ def run_pull(conn: sqlite3.Connection, token: str, session_state: dict):
 
     log.info(f"  Macro: TLT=${macro.get('tlt_price','?')} | "
              f"TYX={macro.get('tyx_yield','?')}% | "
+             f"FVX={macro.get('fvx_yield','?')}% | "
+             f"IRX={macro.get('irx_yield','?')}% | "
              f"USO=${macro.get('uso_price','?')} | "
              f"Regime={macro_regime} | Signal={signal}")
 
@@ -914,6 +923,17 @@ def main():
     session_state  = {}
     last_pull_time = 0
     last_scheduled = {}
+
+    # Pre-market: fetch yield curve immediately on startup so the dashboard
+    # has data before the first market-hours pull at 9:30 ET.
+    log.info("Fetching yield curve on startup...")
+    curve = fetch_yield_curve()
+    if curve:
+        write_yield_curve(conn, curve)
+        session_state["yield_curve_fetched_date"] = datetime.date.today()
+        log.info(f"  Yield curve ready: 2Y={curve.get('y2')}% 10Y={curve.get('y10')}%")
+    else:
+        log.warning("  Startup yield curve fetch failed — will retry on first pull")
 
     from auth import get_valid_access_token
 

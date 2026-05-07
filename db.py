@@ -10,6 +10,11 @@ Changes from v1:
   - Added get_combined_signal() — latest macro regime + signal string
   - All existing functions unchanged
 
+Changes from v2:
+  - fvx_yield and irx_yield added throughout macro functions
+  - get_combined_signal() passes through fvx_yield and irx_yield
+  - _empty_macro() updated to include new columns
+
 All functions return clean pandas DataFrames or scalar values.
 All functions return empty DataFrames / None gracefully on failure.
 """
@@ -85,7 +90,7 @@ def _empty_macro() -> pd.DataFrame:
         "timestamp",
         "tlt_price", "tlt_change", "tlt_chg_pct",
         "uso_price", "uso_change", "uso_chg_pct",
-        "tnx_yield", "tyx_yield",
+        "tnx_yield", "tyx_yield", "fvx_yield", "irx_yield",
         "vix", "vix_change", "vix_chg_pct",
         "regime", "signal",
     ]
@@ -233,16 +238,14 @@ def get_max_pain(symbol: str, offset: int = 0) -> float | None:
         conn.close()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MACRO QUERIES  (new in v2)
+# MACRO QUERIES
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_latest_macro() -> dict | None:
     """
     Return the most recent macro_snapshot row as a dict.
-    Includes TLT, USO, VIX, TNX, TYX, regime, signal.
+    Includes TLT, USO, VIX, TNX, TYX, FVX, IRX, regime, signal.
     Returns None if no macro data available yet.
-
-    Used by the MACRO tab to populate the regime badge and data table.
     """
     conn = get_connection()
     if conn is None:
@@ -270,8 +273,6 @@ def get_macro_history(start_date: str | datetime.date,
     Return all macro_snapshot rows over a date range.
     One row per collector pull cycle (~10 min intervals during market hours).
     Timestamp column parsed as UTC datetime and set as index.
-
-    Used by the backtest engine to filter by macro regime.
     """
     conn = get_connection()
     if conn is None:
@@ -305,11 +306,10 @@ def get_combined_signal() -> dict | None:
 
     Returns dict with keys:
       macro_regime, gex_regime, signal,
-      tlt_price, tyx_yield, uso_price, vix,
+      tlt_price, tyx_yield, fvx_yield, irx_yield, uso_price, vix,
       reason  (plain English explanation string)
 
     Returns None if either table has no data.
-    Used by the MACRO tab regime badge.
     """
     macro   = get_latest_macro()
     summary = get_latest_summary("SPY")
@@ -324,7 +324,6 @@ def get_combined_signal() -> dict | None:
     tlt  = macro.get("tlt_price")
     uso  = macro.get("uso_price")
 
-    # Build plain English reason string
     parts = []
     if tyx:
         if tyx >= 5.0:
@@ -351,6 +350,8 @@ def get_combined_signal() -> dict | None:
         "signal":       signal,
         "tlt_price":    tlt,
         "tyx_yield":    tyx,
+        "fvx_yield":    macro.get("fvx_yield"),
+        "irx_yield":    macro.get("irx_yield"),
         "uso_price":    uso,
         "vix":          macro.get("vix"),
         "tnx_yield":    macro.get("tnx_yield"),
@@ -364,7 +365,7 @@ def get_combined_signal() -> dict | None:
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# YIELD CURVE QUERIES  (new in v2)
+# YIELD CURVE QUERIES
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_yield_curve(date: str | datetime.date | None = None) -> dict | None:
@@ -373,8 +374,6 @@ def get_yield_curve(date: str | datetime.date | None = None) -> dict | None:
     Returns dict with maturity keys: m3, m6, y1, y2, y5, y7, y10, y20, y30
     plus spread_10_2, spread_10_3m, and date.
     Returns None if no data available.
-
-    Used by the MACRO tab to plot today's curve.
     """
     conn = get_connection()
     if conn is None:
@@ -403,8 +402,6 @@ def get_yield_curve_two_days() -> tuple[dict | None, dict | None]:
     Return (today, yesterday) yield curve dicts for the MACRO tab.
     Today = most recent row. Yesterday = second most recent row.
     Either can be None if insufficient data.
-
-    Used to draw today's curve (solid) vs yesterday's (ghost line).
     """
     conn = get_connection()
     if conn is None:
@@ -429,7 +426,6 @@ def get_yield_curve_history(start_date: str | datetime.date,
     """
     Return all yield curve rows over a date range as a DataFrame.
     Date column set as index. Used for historical curve comparison.
-    Returns empty DataFrame if no data.
     """
     conn = get_connection()
     if conn is None:
@@ -456,7 +452,7 @@ def get_yield_curve_history(start_date: str | datetime.date,
         conn.close()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BACKTESTING QUERIES  (unchanged from v1)
+# BACKTESTING QUERIES
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_summary_history(symbol: str,
@@ -720,7 +716,7 @@ def get_session_summary(symbol: str,
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("db.py — Greeks Database Access Layer v2")
+    print("db.py — Greeks Database Access Layer v2.1")
     print(f"Database: {DB_PATH}")
     print()
 
@@ -738,6 +734,8 @@ if __name__ == "__main__":
     if macro:
         print(f"  TLT:    ${macro.get('tlt_price', 'N/A')}")
         print(f"  TYX:    {macro.get('tyx_yield', 'N/A')}%")
+        print(f"  FVX:    {macro.get('fvx_yield', 'N/A')}%")
+        print(f"  IRX:    {macro.get('irx_yield', 'N/A')}%")
         print(f"  USO:    ${macro.get('uso_price', 'N/A')}")
         print(f"  VIX:    {macro.get('vix', 'N/A')}")
         print(f"  Regime: {macro.get('regime', 'N/A')}")
