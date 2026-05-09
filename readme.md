@@ -33,7 +33,7 @@ Create a `.env` file in the project root:
 ```
 SCHWAB_CLIENT_ID=your_client_id
 SCHWAB_CLIENT_SECRET=your_client_secret
-GREEKS_DB_PATH=D:\GreeksData\greeks_history.db   # optional, defaults to local directory
+GREEKS_DB_PATH=E:\GreeksData\greeks_history.db   # optional, defaults to local directory
 ```
 
 Authenticate once to cache your OAuth token:

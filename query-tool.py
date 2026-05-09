@@ -22,7 +22,7 @@ import sys
 #  CONFIG  —  Edit everything in this section
 # ══════════════════════════════════════════════════════════════════════════════
 
-DB_PATH = r"D:/GreeksData/greeks_history.db"   # path to your SQLite database
+DB_PATH = r"E:/GreeksData/greeks_history.db"   # path to your SQLite database
 
 # ── Tickers ───────────────────────────────────────────────────────────────────
 # Any combination of: "SPY", "QQQ", "DIA", "XSP", "IWM"
