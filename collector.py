@@ -4,14 +4,9 @@ Schwab Greeks Historical Data Collector
 Pulls live options chain data from Charles Schwab MarketData API
 every 10 minutes during market hours (9:30am - 4:00pm ET, Mon-Fri).
 
-Changes from v1:
-  - SPY only (removed QQQ, DIA, XSP, IWM)
-  - 10-minute pull interval (was 15)
-  - Guaranteed scheduled pulls at 3:45 PM and 4:00 PM ET
-  - Fixed IV null bug in write_strike_data()
-  - Macro data collection integrated (TLT, USO, VIX, TNX, TYX, FVX, IRX)
-  - Yield curve fetched from Treasury.gov on startup + once per session
-  - Macro regime + combined signal computed and stored each pull
+Stores SPY Greeks (strike_data, summary) and TLT/VIX snapshots
+(macro_snapshot) for backtesting. Yield curve, macro regime, and
+combined signal are handled entirely by the dashboard.
 """
 
 from dotenv import load_dotenv
@@ -24,11 +19,14 @@ import sqlite3
 import datetime
 import logging
 import requests
-import numpy as np
 import pandas as pd
 from zoneinfo import ZoneInfo
-from scipy.stats import norm
-from xml.etree import ElementTree
+
+from greeks import (
+    DTE_BUCKETS, parse_chain, aggregate,
+    calc_gamma_flip, calc_call_wall, calc_put_wall,
+    calc_max_pain, calc_atm_iv, calc_gex_regime,
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -43,15 +41,6 @@ ET            = ZoneInfo("America/New_York")
 
 SYMBOL = "SPY"
 
-DTE_BUCKETS = [
-    (0,   0,   "0DTE"),
-    (1,   7,   "1-7DTE"),
-    (8,   30,  "8-30DTE"),
-    (31,  90,  "31-90DTE"),
-    (91,  180, "91-180DTE"),
-    (181, 999, "180+DTE"),
-]
-
 DB_PATH = os.environ.get("GREEKS_DB_PATH", "greeks_history.db")
 
 PULL_INTERVAL_MINUTES = 10
@@ -60,22 +49,7 @@ SCHEDULED_PULLS = [
     datetime.time(15, 45),
     datetime.time(16,  0),
 ]
-SCHEDULED_PULL_WINDOW = 90  # seconds
-
-REGIME_THRESHOLDS = {
-    "tyx_orange":  4.75,
-    "tyx_red":     5.00,
-    "oil_yellow":  85.0,
-    "oil_orange": 100.0,
-    "oil_red":    110.0,
-    "tlt_52w_low": 83.30,
-    "tlt_key":     84.76,
-}
-
-TREASURY_XML_URL = (
-    "https://home.treasury.gov/resource-center/data-chart-center/"
-    "interest-rates/pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value_month="
-)
+SCHEDULED_PULL_WINDOW = 90
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -150,39 +124,14 @@ def init_db(path: str) -> sqlite3.Connection:
     );
 
     CREATE TABLE IF NOT EXISTS macro_snapshot (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp    TEXT    NOT NULL,
-        tlt_price    REAL,
-        tlt_change   REAL,
-        tlt_chg_pct  REAL,
-        uso_price    REAL,
-        uso_change   REAL,
-        uso_chg_pct  REAL,
-        tnx_yield    REAL,
-        tyx_yield    REAL,
-        fvx_yield    REAL,
-        irx_yield    REAL,
-        vix          REAL,
-        vix_change   REAL,
-        vix_chg_pct  REAL,
-        regime       TEXT,
-        signal       TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS yield_curve (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        date         TEXT    NOT NULL,
-        m3           REAL,
-        m6           REAL,
-        y1           REAL,
-        y2           REAL,
-        y5           REAL,
-        y7           REAL,
-        y10          REAL,
-        y20          REAL,
-        y30          REAL,
-        spread_10_2  REAL,
-        spread_10_3m REAL
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp   TEXT    NOT NULL,
+        tlt_price   REAL,
+        tlt_change  REAL,
+        tlt_chg_pct REAL,
+        vix         REAL,
+        vix_change  REAL,
+        vix_chg_pct REAL
     );
 
     CREATE INDEX IF NOT EXISTS idx_strike_ts     ON strike_data (timestamp, symbol);
@@ -191,18 +140,8 @@ def init_db(path: str) -> sqlite3.Connection:
     CREATE INDEX IF NOT EXISTS idx_summary_ts    ON summary (timestamp, symbol);
     CREATE INDEX IF NOT EXISTS idx_summary_sym   ON summary (symbol);
     CREATE INDEX IF NOT EXISTS idx_macro_ts      ON macro_snapshot (timestamp);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_yield_date ON yield_curve (date);
     """)
     conn.commit()
-
-    # Migrate existing DBs that predate fvx_yield / irx_yield columns
-    for col in ("fvx_yield", "irx_yield"):
-        try:
-            conn.execute(f"ALTER TABLE macro_snapshot ADD COLUMN {col} REAL")
-            conn.commit()
-            log.info(f"  Migration: added {col} column to macro_snapshot")
-        except sqlite3.OperationalError:
-            pass  # column already exists
 
     log.info(f"Database ready: {path}")
     return conn
@@ -337,23 +276,15 @@ def get_options_chain(token: str, symbol: str, spot: float) -> dict | None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_macro_quotes(token: str) -> dict:
-    """
-    Fetch TLT, USO, $VIX, $TNX, $TYX, $FVX, $IRX in a single quotes call.
-    Returns dict with all macro values. Any failed field returns None.
-    """
-    symbols = ["TLT", "USO", "$VIX", "$TNX", "$TYX", "$FVX", "$IRX"]
-    result  = {
+    result = {
         "tlt_price": None, "tlt_change": None, "tlt_chg_pct": None,
-        "uso_price": None, "uso_change": None, "uso_chg_pct": None,
         "vix":       None, "vix_change": None, "vix_chg_pct": None,
-        "tnx_yield": None, "tyx_yield":  None,
-        "fvx_yield": None, "irx_yield":  None,
     }
     try:
         r = requests.get(
             f"{SCHWAB_BASE}/quotes",
             headers={"Authorization": f"Bearer {token}"},
-            params={"symbols": ",".join(symbols)},
+            params={"symbols": "TLT,$VIX"},
             timeout=15,
         )
         r.raise_for_status()
@@ -371,362 +302,15 @@ def get_macro_quotes(token: str) -> dict:
             return last, chg, chg_pct
 
         tlt_p, tlt_c, tlt_pct = _extract("TLT")
-        uso_p, uso_c, uso_pct = _extract("USO")
         vix_p, vix_c, vix_pct = _extract("$VIX")
-
         result.update({
             "tlt_price": tlt_p, "tlt_change": tlt_c, "tlt_chg_pct": tlt_pct,
-            "uso_price": uso_p, "uso_change": uso_c, "uso_chg_pct": uso_pct,
             "vix":       vix_p, "vix_change": vix_c, "vix_chg_pct": vix_pct,
         })
-
-        # Index yields — Schwab returns as x10 (e.g. 44.4 = 4.44%)
-        for key, sym in [
-            ("tnx_yield", "$TNX"),
-            ("tyx_yield", "$TYX"),
-            ("fvx_yield", "$FVX"),
-            ("irx_yield", "$IRX"),
-        ]:
-            inner = qd.get(sym, {})
-            quote = inner.get("quote", inner)
-            raw   = quote.get("lastPrice") or quote.get("mark")
-            if raw:
-                result[key] = round(raw / 10, 4)
-
     except Exception as e:
         log.warning(f"  Macro quotes fetch failed: {e}")
 
     return result
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MACRO REGIME CLASSIFICATION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def classify_macro_regime(tlt_price: float | None,
-                          tyx_yield: float | None,
-                          uso_price: float | None,
-                          tlt_prev:  float | None = None) -> str:
-    t = REGIME_THRESHOLDS
-
-    # RED — any single trigger
-    if tyx_yield and tyx_yield >= t["tyx_red"]:
-        return "RED"
-    if uso_price and uso_price >= t["oil_red"]:
-        return "RED"
-    if tlt_price and tlt_price <= t["tlt_52w_low"] * 1.005:
-        return "RED"
-
-    # ORANGE
-    if tyx_yield and tyx_yield >= t["tyx_orange"]:
-        return "ORANGE"
-    if uso_price and uso_price >= t["oil_orange"]:
-        return "ORANGE"
-    if tlt_price and tlt_prev and tlt_price < tlt_prev:
-        return "ORANGE"
-
-    # YELLOW
-    if uso_price and uso_price >= t["oil_yellow"]:
-        return "YELLOW"
-    if tyx_yield and tyx_yield >= 4.50:
-        return "YELLOW"
-
-    return "GREEN"
-
-
-def build_regime_reason(tlt_price: float | None,
-                        tyx_yield: float | None,
-                        uso_price: float | None) -> str:
-    t     = REGIME_THRESHOLDS
-    parts = []
-    if tyx_yield:
-        if tyx_yield >= t["tyx_red"]:
-            parts.append(f"TYX {tyx_yield:.2f}% — danger zone breach")
-        elif tyx_yield >= t["tyx_orange"]:
-            parts.append(f"TYX {tyx_yield:.2f}% approaching danger zone")
-        else:
-            parts.append(f"TYX {tyx_yield:.2f}%")
-    if uso_price:
-        if uso_price >= t["oil_red"]:
-            parts.append(f"Oil significantly elevated (USO ${uso_price:.2f})")
-        elif uso_price >= t["oil_orange"]:
-            parts.append(f"Oil elevated (USO ${uso_price:.2f})")
-    if tlt_price:
-        if tlt_price <= t["tlt_52w_low"] * 1.005:
-            parts.append(f"TLT ${tlt_price:.2f} near 52-week low")
-        elif tlt_price <= t["tlt_key"]:
-            parts.append(f"TLT ${tlt_price:.2f} below key level")
-    return " | ".join(parts) if parts else "All macro indicators within normal range"
-
-
-def build_combined_signal(macro_regime: str, gex_regime: str) -> str:
-    gex_bearish = gex_regime in ("WEAK_NEG", "STRONG_NEG", "FLIP_ZONE")
-    matrix = {
-        ("GREEN",  True):  "LONG BIAS",
-        ("GREEN",  False): "CONFLICTED — REDUCE SIZE",
-        ("YELLOW", True):  "NEUTRAL — WAIT FOR CONFIRMATION",
-        ("YELLOW", False): "NEUTRAL — WAIT FOR CONFIRMATION",
-        ("ORANGE", True):  "SHORT BIAS",
-        ("ORANGE", False): "CONFLICTED — MACRO VS GREEKS",
-        ("RED",    True):  "HIGH CONVICTION SHORT",
-        ("RED",    False): "CAUTION — MACRO FIGHTING GREEKS",
-    }
-    return matrix.get((macro_regime, gex_bearish), "NEUTRAL")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TREASURY YIELD CURVE
-# ══════════════════════════════════════════════════════════════════════════════
-
-def fetch_yield_curve(target_date: datetime.date | None = None) -> dict | None:
-    base_date = target_date or datetime.date.today()
-    months_to_try = [
-        base_date.strftime("%Y%m"),
-        (base_date.replace(day=1) - datetime.timedelta(days=1)).strftime("%Y%m"),
-    ]
-    for month_str in months_to_try:
-        url = TREASURY_XML_URL + month_str
-        try:
-            r = requests.get(url, timeout=20)
-            r.raise_for_status()
-            root = ElementTree.fromstring(r.content)
-            ns = {
-                "m":    "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata",
-                "d":    "http://schemas.microsoft.com/ado/2007/08/dataservices",
-                "atom": "http://www.w3.org/2005/Atom",
-            }
-            entries = root.findall("atom:entry/atom:content/m:properties", ns)
-            if not entries:
-                continue
-
-            best = entries[-1]  # Treasury returns oldest first, newest last
-            date_el = best.find("d:NEW_DATE", ns)
-            actual_date = date_el.text[:10] if (date_el is not None and date_el.text) else base_date.isoformat()
-
-            def _val(tag):
-                el = best.find(f"d:{tag}", ns)
-                if el is not None and el.text:
-                    try: return float(el.text)
-                    except: pass
-                return None
-
-            m3  = _val("BC_1MONTH") or _val("BC_3MONTH")
-            m6  = _val("BC_6MONTH")
-            y1  = _val("BC_1YEAR")
-            y2  = _val("BC_2YEAR")
-            y5  = _val("BC_5YEAR")
-            y7  = _val("BC_7YEAR")
-            y10 = _val("BC_10YEAR")
-            y20 = _val("BC_20YEAR")
-            y30 = _val("BC_30YEAR")
-
-            spread_10_2  = round(y10 - y2,  4) if (y10 and y2)  else None
-            spread_10_3m = round(y10 - m3,  4) if (y10 and m3)  else None
-
-            log.info(f"  Yield curve ({actual_date}): 2Y={y2}% 10Y={y10}% 30Y={y30}%")
-            return {
-                "date": actual_date,
-                "m3": m3, "m6": m6, "y1": y1, "y2": y2,
-                "y5": y5, "y7": y7, "y10": y10, "y20": y20, "y30": y30,
-                "spread_10_2": spread_10_2, "spread_10_3m": spread_10_3m,
-            }
-        except Exception as e:
-            log.warning(f"  Yield curve fetch failed ({month_str}): {e}")
-            continue
-    return None
-
-
-def write_yield_curve(conn: sqlite3.Connection, data: dict):
-    conn.execute("""
-        INSERT OR REPLACE INTO yield_curve
-            (date, m3, m6, y1, y2, y5, y7, y10, y20, y30,
-             spread_10_2, spread_10_3m)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        data["date"],
-        data.get("m3"),  data.get("m6"),  data.get("y1"),
-        data.get("y2"),  data.get("y5"),  data.get("y7"),
-        data.get("y10"), data.get("y20"), data.get("y30"),
-        data.get("spread_10_2"), data.get("spread_10_3m"),
-    ))
-    conn.commit()
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BLACK-SCHOLES
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _d1(S, K, T, r, s): return (np.log(S/K) + (r + 0.5*s**2)*T) / (s*np.sqrt(T))
-def _d2(S, K, T, r, s): return _d1(S,K,T,r,s) - s*np.sqrt(T)
-
-def calc_gamma(S, K, T, r, s):
-    return norm.pdf(_d1(S,K,T,r,s)) / (S * s * np.sqrt(T))
-
-def calc_vanna(S, K, T, r, s):
-    return -norm.pdf(_d1(S,K,T,r,s)) * _d2(S,K,T,r,s) / s
-
-def calc_charm(S, K, T, r, s, call):
-    d1  = _d1(S,K,T,r,s)
-    d2  = _d2(S,K,T,r,s)
-    raw = -norm.pdf(d1) * (2*r*T - d2*s*np.sqrt(T)) / (2*T*s*np.sqrt(T))
-    return raw/365 if call else (raw + 2*r*norm.cdf(-d1))/365
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DTE BUCKETING
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_dte_bucket(dte: float) -> str:
-    for lo, hi, label in DTE_BUCKETS:
-        if lo <= dte <= hi:
-            return label
-    return "180+DTE"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PARSE CHAIN
-# ══════════════════════════════════════════════════════════════════════════════
-
-def parse_chain(chain: dict, r: float = RISK_FREE) -> pd.DataFrame:
-    S    = chain["underlyingPrice"]
-    rows = []
-
-    for side, exp_map in [
-        ("call", chain.get("callExpDateMap", {})),
-        ("put",  chain.get("putExpDateMap",  {})),
-    ]:
-        call = (side == "call")
-        for exp_key, strikes in exp_map.items():
-            try:    dte = float(exp_key.split(":")[1])
-            except: continue
-            T = dte / 365
-            if T <= 0: continue
-            bucket = get_dte_bucket(dte)
-            for ks, contracts in strikes.items():
-                K = float(ks)
-                if abs(K - S) / S > STRIKE_PCT: continue
-                c     = contracts[0]
-                iv    = c.get("volatility", 0)
-                if not iv or iv <= 0: continue
-                sigma = iv / 100
-                oi    = c.get("openInterest", 0) or 0
-                vol   = c.get("totalVolume",  0) or 0
-                if oi < 1: continue
-                try:
-                    g  = calc_gamma(S, K, T, r, sigma)
-                    va = calc_vanna(S, K, T, r, sigma)
-                    ch = calc_charm(S, K, T, r, sigma, call)
-                except: continue
-                mult = oi * 100
-                sign = 1 if call else -1
-                rows.append({
-                    "strike":       K,
-                    "dte":          dte,
-                    "dte_bucket":   bucket,
-                    "type":         side,
-                    "oi":           oi,
-                    "volume":       vol,
-                    "iv":           sigma,
-                    "GEX_call":     g  * mult * S if call     else 0,
-                    "GEX_put":     -g  * mult * S if not call else 0,
-                    "VannEX_call":  va * mult      if call     else 0,
-                    "VannEX_put":  -va * mult      if not call else 0,
-                    "VannEX":       sign * va * mult,
-                    "CharmEX_call": ch * mult      if call     else 0,
-                    "CharmEX_put": -ch * mult      if not call else 0,
-                    "CharmEX":      sign * ch * mult,
-                })
-
-    return pd.DataFrame(rows)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# AGGREGATE
-# ══════════════════════════════════════════════════════════════════════════════
-
-def aggregate(df: pd.DataFrame) -> pd.DataFrame:
-    cols = [
-        "GEX_call", "GEX_put",
-        "VannEX", "VannEX_call", "VannEX_put",
-        "CharmEX", "CharmEX_call", "CharmEX_put",
-        "oi", "volume",
-    ]
-    a = (df.groupby(["strike", "dte", "dte_bucket"])[cols]
-           .sum()
-           .reset_index()
-           .sort_values(["strike", "dte"]))
-    a["GEX_net"] = a["GEX_call"] + a["GEX_put"]
-
-    iv_pivot = (df.pivot_table(
-                    index=["strike", "dte"],
-                    columns="type",
-                    values="iv",
-                    aggfunc="first")
-                  .reset_index())
-
-    rename_map = {}
-    if "call" in iv_pivot.columns: rename_map["call"] = "iv_call"
-    if "put"  in iv_pivot.columns: rename_map["put"]  = "iv_put"
-    iv_pivot = iv_pivot.rename(columns=rename_map)
-
-    for col in ["iv_call", "iv_put"]:
-        if col not in iv_pivot.columns:
-            iv_pivot[col] = np.nan
-
-    a = a.merge(iv_pivot[["strike", "dte", "iv_call", "iv_put"]],
-                on=["strike", "dte"], how="left")
-    return a
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STRUCTURAL CALCULATIONS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def calc_gamma_flip(agg: pd.DataFrame) -> float | None:
-    by_strike = agg.groupby("strike")["GEX_net"].sum().reset_index()
-    pos = by_strike[by_strike["GEX_net"] > 0]["strike"]
-    neg = by_strike[by_strike["GEX_net"] < 0]["strike"]
-    if pos.empty or neg.empty:
-        return None
-    return round((pos.min() + neg.max()) / 2, 2)
-
-
-def calc_call_wall(agg: pd.DataFrame) -> float | None:
-    by_strike = agg.groupby("strike")["GEX_call"].sum()
-    return float(by_strike.idxmax()) if not by_strike.empty else None
-
-
-def calc_put_wall(agg: pd.DataFrame) -> float | None:
-    by_strike = agg.groupby("strike")["GEX_put"].sum()
-    return float(by_strike.idxmin()) if not by_strike.empty else None
-
-
-def calc_max_pain(df: pd.DataFrame) -> float | None:
-    strikes = df["strike"].unique()
-    if len(strikes) == 0:
-        return None
-    pain  = {}
-    calls = df[df["type"] == "call"]
-    puts  = df[df["type"] == "put"]
-    for s in strikes:
-        call_pain = ((s - calls["strike"]).clip(lower=0) * calls["oi"]).sum()
-        put_pain  = ((puts["strike"] - s).clip(lower=0)  * puts["oi"]).sum()
-        pain[s]   = call_pain + put_pain
-    return float(min(pain, key=pain.get))
-
-
-def calc_atm_iv(df: pd.DataFrame, spot: float) -> float | None:
-    calls = df[df["type"] == "call"].copy()
-    if calls.empty:
-        return None
-    calls["dist"] = (calls["strike"] - spot).abs()
-    closest = calls.nsmallest(1, "dist")
-    return float(closest["iv"].values[0]) if not closest.empty else None
-
-
-def calc_gex_regime(agg: pd.DataFrame, spot: float,
-                    gamma_flip: float | None) -> str:
-    net_gex = float(agg["GEX_net"].sum())
-    if gamma_flip and spot > 0:
-        if abs(spot - gamma_flip) / spot <= 0.005:
-            return "FLIP_ZONE"
-    if net_gex >= 2e9:  return "STRONG_POS"
-    if net_gex >= 0:    return "WEAK_POS"
-    if net_gex >= -2e9: return "WEAK_NEG"
-    return "STRONG_NEG"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATABASE WRITERS
@@ -799,25 +383,17 @@ def write_summary(conn: sqlite3.Connection, ts: str,
     conn.commit()
 
 
-def write_macro_snapshot(conn: sqlite3.Connection, ts: str,
-                         macro: dict, regime: str, signal: str):
+def write_macro_snapshot(conn: sqlite3.Connection, ts: str, macro: dict):
     conn.execute("""
         INSERT INTO macro_snapshot (
             timestamp,
             tlt_price, tlt_change, tlt_chg_pct,
-            uso_price, uso_change, uso_chg_pct,
-            tnx_yield, tyx_yield, fvx_yield, irx_yield,
-            vix, vix_change, vix_chg_pct,
-            regime, signal
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            vix, vix_change, vix_chg_pct
+        ) VALUES (?,?,?,?,?,?,?)
     """, (
         ts,
-        macro.get("tlt_price"),  macro.get("tlt_change"),  macro.get("tlt_chg_pct"),
-        macro.get("uso_price"),  macro.get("uso_change"),  macro.get("uso_chg_pct"),
-        macro.get("tnx_yield"),  macro.get("tyx_yield"),
-        macro.get("fvx_yield"),  macro.get("irx_yield"),
-        macro.get("vix"),        macro.get("vix_change"),  macro.get("vix_chg_pct"),
-        regime, signal,
+        macro.get("tlt_price"), macro.get("tlt_change"), macro.get("tlt_chg_pct"),
+        macro.get("vix"),       macro.get("vix_change"), macro.get("vix_chg_pct"),
     ))
     conn.commit()
 
@@ -825,7 +401,7 @@ def write_macro_snapshot(conn: sqlite3.Connection, ts: str,
 # SINGLE PULL CYCLE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_pull(conn: sqlite3.Connection, token: str, session_state: dict):
+def run_pull(conn: sqlite3.Connection, token: str):
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     log.info(f"Pull started — {ts}")
 
@@ -859,41 +435,13 @@ def run_pull(conn: sqlite3.Connection, token: str, session_state: dict):
              f"Charm {agg['CharmEX'].sum()/1e6:+.4f}M | "
              f"Flip ${gamma_flip} | Regime: {gex_regime}")
 
-    # ── Macro quotes ───────────────────────────────────────────────────────────
+    # ── TLT + VIX snapshot ─────────────────────────────────────────────────────
     time.sleep(1)
     macro = get_macro_quotes(token)
-
-    macro_regime = classify_macro_regime(
-        tlt_price = macro.get("tlt_price"),
-        tyx_yield = macro.get("tyx_yield"),
-        uso_price = macro.get("uso_price"),
-        tlt_prev  = session_state.get("last_tlt_price"),
-    )
-
-    if macro.get("tlt_price"):
-        session_state["last_tlt_price"] = macro["tlt_price"]
-
-    signal = build_combined_signal(macro_regime, gex_regime)
-    write_macro_snapshot(conn, ts, macro, macro_regime, signal)
+    write_macro_snapshot(conn, ts, macro)
 
     log.info(f"  Macro: TLT=${macro.get('tlt_price','?')} | "
-             f"TYX={macro.get('tyx_yield','?')}% | "
-             f"FVX={macro.get('fvx_yield','?')}% | "
-             f"IRX={macro.get('irx_yield','?')}% | "
-             f"USO=${macro.get('uso_price','?')} | "
-             f"Regime={macro_regime} | Signal={signal}")
-
-    # ── Yield curve — once per session ─────────────────────────────────────────
-    today = datetime.date.today()
-    if session_state.get("yield_curve_fetched_date") != today:
-        log.info("  Fetching Treasury yield curve...")
-        curve = fetch_yield_curve()
-        if curve:
-            write_yield_curve(conn, curve)
-            session_state["yield_curve_fetched_date"] = today
-            log.info(f"  Yield curve stored for {curve['date']}")
-        else:
-            log.warning("  Yield curve fetch failed — will retry next pull")
+             f"VIX={macro.get('vix','?')}")
 
     log.info("Pull complete\n")
 
@@ -920,20 +468,8 @@ def main():
     log.info("═" * 55)
 
     conn           = init_db(DB_PATH)
-    session_state  = {}
     last_pull_time = 0
     last_scheduled = {}
-
-    # Pre-market: fetch yield curve immediately on startup so the dashboard
-    # has data before the first market-hours pull at 9:30 ET.
-    log.info("Fetching yield curve on startup...")
-    curve = fetch_yield_curve()
-    if curve:
-        write_yield_curve(conn, curve)
-        session_state["yield_curve_fetched_date"] = datetime.date.today()
-        log.info(f"  Yield curve ready: 2Y={curve.get('y2')}% 10Y={curve.get('y10')}%")
-    else:
-        log.warning("  Startup yield curve fetch failed — will retry on first pull")
 
     from auth import get_valid_access_token
 
@@ -944,7 +480,6 @@ def main():
                 hrs  = secs // 3600
                 mins = (secs % 3600) // 60
                 log.info(f"Market closed — sleeping {hrs}h {mins}m until next open")
-                session_state  = {}
                 last_scheduled = {}
                 time.sleep(60)
                 continue
@@ -968,7 +503,7 @@ def main():
                 time.sleep(60)
                 continue
 
-            run_pull(conn, token, session_state)
+            run_pull(conn, token)
             last_pull_time = time.time()
 
             log.info(f"Next pull in {PULL_INTERVAL_MINUTES} min "
