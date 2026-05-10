@@ -19,13 +19,14 @@ import sqlite3
 import datetime
 import logging
 import requests
+import numpy as np
 import pandas as pd
 from zoneinfo import ZoneInfo
 
 from greeks import (
     DTE_BUCKETS, parse_chain, aggregate,
     calc_gamma_flip, calc_call_wall, calc_put_wall,
-    calc_max_pain, calc_atm_iv, calc_gex_regime,
+    calc_max_pain, calc_atm_iv, calc_gex_regime, calc_iv_skew,
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -76,6 +77,7 @@ def init_db(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
 
+    # ── strike_data (unchanged structure, add call/put OI split if missing) ──
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS strike_data (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,30 +99,11 @@ def init_db(path: str) -> sqlite3.Connection:
         total_oi        INTEGER,
         total_volume    INTEGER,
         iv_call         REAL,
-        iv_put          REAL
-    );
-
-    CREATE TABLE IF NOT EXISTS summary (
-        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp           TEXT    NOT NULL,
-        symbol              TEXT    NOT NULL,
-        spot                REAL    NOT NULL,
-        net_GEX             REAL,
-        net_VannEX          REAL,
-        net_CharmEX         REAL,
-        gamma_flip          REAL,
-        call_wall           REAL,
-        put_wall            REAL,
-        max_pain            REAL,
-        total_oi            INTEGER,
-        total_volume        INTEGER,
-        iv_atm              REAL,
-        gex_0dte            REAL,
-        gex_1_7dte          REAL,
-        gex_8_30dte         REAL,
-        gex_31_90dte        REAL,
-        gex_91_180dte       REAL,
-        gex_180plus_dte     REAL
+        iv_put          REAL,
+        call_oi         INTEGER,
+        put_oi          INTEGER,
+        call_volume     INTEGER,
+        put_volume      INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS macro_snapshot (
@@ -137,12 +120,126 @@ def init_db(path: str) -> sqlite3.Connection:
     CREATE INDEX IF NOT EXISTS idx_strike_ts     ON strike_data (timestamp, symbol);
     CREATE INDEX IF NOT EXISTS idx_strike_sym    ON strike_data (symbol, strike);
     CREATE INDEX IF NOT EXISTS idx_strike_bucket ON strike_data (symbol, dte_bucket);
-    CREATE INDEX IF NOT EXISTS idx_summary_ts    ON summary (timestamp, symbol);
-    CREATE INDEX IF NOT EXISTS idx_summary_sym   ON summary (symbol);
     CREATE INDEX IF NOT EXISTS idx_macro_ts      ON macro_snapshot (timestamp);
     """)
-    conn.commit()
 
+    # Add call/put OI columns to strike_data if upgrading from old schema
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(strike_data)")}
+    for col, typ in [("call_oi","INTEGER"),("put_oi","INTEGER"),
+                     ("call_volume","INTEGER"),("put_volume","INTEGER")]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE strike_data ADD COLUMN {col} {typ}")
+            log.info(f"  Migrated strike_data: added {col}")
+
+    # ── summary: migrate v1 → v2 if needed, else create fresh ────────────────
+    summary_cols = {r[1] for r in conn.execute("PRAGMA table_info(summary)")}
+
+    if "net_GEX" in summary_cols:
+        log.info("Migrating summary table v1 → v2 …")
+        conn.executescript("""
+            ALTER TABLE summary RENAME TO summary_v1;
+
+            CREATE TABLE summary (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp         TEXT    NOT NULL,
+                symbol            TEXT    NOT NULL,
+                spot              REAL    NOT NULL,
+                gamma_flip        REAL,
+                call_wall         REAL,
+                put_wall          REAL,
+                max_pain          REAL,
+                iv_atm            REAL,
+                iv_skew           REAL,
+                gex_0dte          REAL,
+                gex_1_7dte        REAL,
+                gex_8_30dte       REAL,
+                gex_31_90dte      REAL,
+                gex_91_180dte     REAL,
+                gex_180plus_dte   REAL,
+                vanna_0dte        REAL,
+                vanna_1_7dte      REAL,
+                vanna_8_30dte     REAL,
+                vanna_31_90dte    REAL,
+                vanna_91_180dte   REAL,
+                vanna_180plus_dte REAL,
+                charm_0dte        REAL,
+                charm_1_7dte      REAL,
+                charm_8_30dte     REAL,
+                charm_31_90dte    REAL,
+                charm_91_180dte   REAL,
+                charm_180plus_dte REAL,
+                call_oi           INTEGER,
+                put_oi            INTEGER,
+                call_volume       INTEGER,
+                put_volume        INTEGER,
+                spy_equity_volume INTEGER,
+                realized_vol_5d   REAL,
+                realized_vol_21d  REAL
+            );
+
+            INSERT INTO summary (
+                timestamp, symbol, spot,
+                gamma_flip, call_wall, put_wall, max_pain, iv_atm,
+                gex_0dte, gex_1_7dte, gex_8_30dte,
+                gex_31_90dte, gex_91_180dte, gex_180plus_dte
+            )
+            SELECT
+                timestamp, symbol, spot,
+                gamma_flip, call_wall, put_wall, max_pain, iv_atm,
+                gex_0dte, gex_1_7dte, gex_8_30dte,
+                gex_31_90dte, gex_91_180dte, gex_180plus_dte
+            FROM summary_v1;
+
+            DROP TABLE summary_v1;
+        """)
+        log.info("  Summary migration complete — historical rows have NULL for new columns.")
+
+    elif "timestamp" not in summary_cols:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS summary (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp         TEXT    NOT NULL,
+                symbol            TEXT    NOT NULL,
+                spot              REAL    NOT NULL,
+                gamma_flip        REAL,
+                call_wall         REAL,
+                put_wall          REAL,
+                max_pain          REAL,
+                iv_atm            REAL,
+                iv_skew           REAL,
+                gex_0dte          REAL,
+                gex_1_7dte        REAL,
+                gex_8_30dte       REAL,
+                gex_31_90dte      REAL,
+                gex_91_180dte     REAL,
+                gex_180plus_dte   REAL,
+                vanna_0dte        REAL,
+                vanna_1_7dte      REAL,
+                vanna_8_30dte     REAL,
+                vanna_31_90dte    REAL,
+                vanna_91_180dte   REAL,
+                vanna_180plus_dte REAL,
+                charm_0dte        REAL,
+                charm_1_7dte      REAL,
+                charm_8_30dte     REAL,
+                charm_31_90dte    REAL,
+                charm_91_180dte   REAL,
+                charm_180plus_dte REAL,
+                call_oi           INTEGER,
+                put_oi            INTEGER,
+                call_volume       INTEGER,
+                put_volume        INTEGER,
+                spy_equity_volume INTEGER,
+                realized_vol_5d   REAL,
+                realized_vol_21d  REAL
+            );
+        """)
+
+    conn.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_summary_ts  ON summary (timestamp, symbol);
+        CREATE INDEX IF NOT EXISTS idx_summary_sym ON summary (symbol);
+    """)
+    conn.commit()
     log.info(f"Database ready: {path}")
     return conn
 
@@ -216,7 +313,7 @@ def is_scheduled_pull_due(last_scheduled: dict) -> bool:
 # SCHWAB API — OPTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_spot(token: str, symbol: str) -> float | None:
+def get_spot(token: str, symbol: str) -> dict | None:
     try:
         r = requests.get(
             f"{SCHWAB_BASE}/quotes",
@@ -227,9 +324,15 @@ def get_spot(token: str, symbol: str) -> float | None:
         r.raise_for_status()
         qd    = r.json()
         inner = qd.get(symbol, list(qd.values())[0] if qd else {})
-        return (inner.get("quote", {}).get("lastPrice")
-                or inner.get("lastPrice")
-                or inner.get("mark"))
+        quote = inner.get("quote", inner)
+        price = quote.get("lastPrice") or quote.get("mark")
+        if not price:
+            return None
+        vol = quote.get("totalVolume")
+        return {
+            "spot":           float(price),
+            "equity_volume":  int(vol) if vol is not None else None,
+        }
     except Exception as e:
         log.warning(f"  Spot fetch failed for {symbol}: {e}")
         return None
@@ -313,6 +416,31 @@ def get_macro_quotes(token: str) -> dict:
     return result
 
 # ══════════════════════════════════════════════════════════════════════════════
+# REALIZED VOLATILITY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def calc_realized_vol(conn: sqlite3.Connection, symbol: str,
+                      current_ts: str, n_days: int) -> float | None:
+    """Close-to-close realized volatility over n_days trading days, annualized."""
+    rows = conn.execute("""
+        SELECT spot FROM summary
+        WHERE symbol = ? AND timestamp IN (
+            SELECT MAX(timestamp)
+            FROM summary
+            WHERE symbol = ? AND timestamp <= ?
+            GROUP BY DATE(timestamp)
+        )
+        ORDER BY timestamp DESC
+        LIMIT ?
+    """, (symbol, symbol, current_ts, n_days + 1)).fetchall()
+
+    if len(rows) < 2:
+        return None
+    spots    = np.array([r[0] for r in rows], dtype=float)[::-1]
+    log_rets = np.diff(np.log(spots))
+    return float(np.std(log_rets, ddof=1) * np.sqrt(252))
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DATABASE WRITERS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -331,6 +459,8 @@ def write_strike_data(conn: sqlite3.Connection, ts: str,
             int(r.get("oi", 0)), int(r.get("volume", 0)),
             None if (iv_call is None or pd.isna(iv_call)) else float(iv_call),
             None if (iv_put  is None or pd.isna(iv_put))  else float(iv_put),
+            int(r.get("call_oi",     0)), int(r.get("put_oi",     0)),
+            int(r.get("call_volume", 0)), int(r.get("put_volume", 0)),
         ))
     conn.executemany("""
         INSERT INTO strike_data (
@@ -338,47 +468,59 @@ def write_strike_data(conn: sqlite3.Connection, ts: str,
             GEX_call, GEX_put, GEX_net,
             VannEX_call, VannEX_put, VannEX_net,
             CharmEX_call, CharmEX_put, CharmEX_net,
-            total_oi, total_volume, iv_call, iv_put
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            total_oi, total_volume, iv_call, iv_put,
+            call_oi, put_oi, call_volume, put_volume
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, rows)
     conn.commit()
 
 
 def write_summary(conn: sqlite3.Connection, ts: str,
                   symbol: str, spot: float,
-                  agg: pd.DataFrame, df_raw: pd.DataFrame):
-    bucket_gex = {}
-    for _, label in [(lo, lbl) for lo, hi, lbl in DTE_BUCKETS]:
-        subset = agg[agg["dte_bucket"] == label]["GEX_net"].sum()
-        bucket_gex[label] = float(subset)
+                  agg: pd.DataFrame, df_raw: pd.DataFrame,
+                  equity_volume: int | None = None,
+                  iv_skew: float | None = None,
+                  realized_vol_5d: float | None = None,
+                  realized_vol_21d: float | None = None):
+    bucket_labels = ["0DTE", "1-7DTE", "8-30DTE", "31-90DTE", "91-180DTE", "180+DTE"]
+    bucket_gex, bucket_vanna, bucket_charm = {}, {}, {}
+    for label in bucket_labels:
+        sub = agg[agg["dte_bucket"] == label]
+        bucket_gex[label]   = float(sub["GEX_net"].sum())
+        bucket_vanna[label] = float(sub["VannEX"].sum())
+        bucket_charm[label] = float(sub["CharmEX"].sum())
 
     conn.execute("""
         INSERT INTO summary (
             timestamp, symbol, spot,
-            net_GEX, net_VannEX, net_CharmEX,
             gamma_flip, call_wall, put_wall, max_pain,
-            total_oi, total_volume, iv_atm,
+            iv_atm, iv_skew,
             gex_0dte, gex_1_7dte, gex_8_30dte,
-            gex_31_90dte, gex_91_180dte, gex_180plus_dte
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            gex_31_90dte, gex_91_180dte, gex_180plus_dte,
+            vanna_0dte, vanna_1_7dte, vanna_8_30dte,
+            vanna_31_90dte, vanna_91_180dte, vanna_180plus_dte,
+            charm_0dte, charm_1_7dte, charm_8_30dte,
+            charm_31_90dte, charm_91_180dte, charm_180plus_dte,
+            call_oi, put_oi, call_volume, put_volume,
+            spy_equity_volume, realized_vol_5d, realized_vol_21d
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         ts, symbol, spot,
-        float(agg["GEX_net"].sum()),
-        float(agg["VannEX"].sum()),
-        float(agg["CharmEX"].sum()),
-        calc_gamma_flip(agg),
-        calc_call_wall(agg),
-        calc_put_wall(agg),
+        calc_gamma_flip(agg), calc_call_wall(agg), calc_put_wall(agg),
         calc_max_pain(df_raw),
-        int(agg["oi"].sum()),
-        int(agg["volume"].sum()),
-        calc_atm_iv(df_raw, spot),
-        bucket_gex.get("0DTE",      0),
-        bucket_gex.get("1-7DTE",    0),
-        bucket_gex.get("8-30DTE",   0),
-        bucket_gex.get("31-90DTE",  0),
-        bucket_gex.get("91-180DTE", 0),
-        bucket_gex.get("180+DTE",   0),
+        calc_atm_iv(df_raw, spot), iv_skew,
+        bucket_gex.get("0DTE",      0), bucket_gex.get("1-7DTE",    0),
+        bucket_gex.get("8-30DTE",   0), bucket_gex.get("31-90DTE",  0),
+        bucket_gex.get("91-180DTE", 0), bucket_gex.get("180+DTE",   0),
+        bucket_vanna.get("0DTE",      0), bucket_vanna.get("1-7DTE",    0),
+        bucket_vanna.get("8-30DTE",   0), bucket_vanna.get("31-90DTE",  0),
+        bucket_vanna.get("91-180DTE", 0), bucket_vanna.get("180+DTE",   0),
+        bucket_charm.get("0DTE",      0), bucket_charm.get("1-7DTE",    0),
+        bucket_charm.get("8-30DTE",   0), bucket_charm.get("31-90DTE",  0),
+        bucket_charm.get("91-180DTE", 0), bucket_charm.get("180+DTE",   0),
+        int(agg["call_oi"].sum()),     int(agg["put_oi"].sum()),
+        int(agg["call_volume"].sum()), int(agg["put_volume"].sum()),
+        equity_volume, realized_vol_5d, realized_vol_21d,
     ))
     conn.commit()
 
@@ -406,10 +548,12 @@ def run_pull(conn: sqlite3.Connection, token: str):
     log.info(f"Pull started — {ts}")
 
     # ── SPY options ────────────────────────────────────────────────────────────
-    spot = get_spot(token, SYMBOL)
-    if not spot:
+    spot_data = get_spot(token, SYMBOL)
+    if not spot_data:
         log.warning(f"  Skipping {SYMBOL} — no spot price")
         return
+    spot          = spot_data["spot"]
+    equity_volume = spot_data["equity_volume"]
 
     time.sleep(1)
     chain = get_options_chain(token, SYMBOL, spot)
@@ -425,9 +569,16 @@ def run_pull(conn: sqlite3.Connection, token: str):
     agg        = aggregate(df_raw)
     gamma_flip = calc_gamma_flip(agg)
     gex_regime = calc_gex_regime(agg, spot, gamma_flip)
+    iv_skew    = calc_iv_skew(df_raw, spot)
+    rv5        = calc_realized_vol(conn, SYMBOL, ts, 5)
+    rv21       = calc_realized_vol(conn, SYMBOL, ts, 21)
 
     write_strike_data(conn, ts, SYMBOL, spot, agg)
-    write_summary(conn, ts, SYMBOL, spot, agg, df_raw)
+    write_summary(conn, ts, SYMBOL, spot, agg, df_raw,
+                  equity_volume=equity_volume,
+                  iv_skew=iv_skew,
+                  realized_vol_5d=rv5,
+                  realized_vol_21d=rv21)
 
     log.info(f"  {SYMBOL} ${spot:.2f} | "
              f"GEX {agg['GEX_net'].sum()/1e9:+.3f}B | "

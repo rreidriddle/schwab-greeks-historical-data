@@ -122,18 +122,30 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
                     values="iv",
                     aggfunc="first")
                   .reset_index())
-
     rename_map = {}
     if "call" in iv_pivot.columns: rename_map["call"] = "iv_call"
     if "put"  in iv_pivot.columns: rename_map["put"]  = "iv_put"
     iv_pivot = iv_pivot.rename(columns=rename_map)
-
     for col in ["iv_call", "iv_put"]:
         if col not in iv_pivot.columns:
             iv_pivot[col] = np.nan
 
-    return a.merge(iv_pivot[["strike", "dte", "iv_call", "iv_put"]],
-                   on=["strike", "dte"], how="left")
+    call_oi = (df[df["type"] == "call"]
+               .groupby(["strike", "dte"])[["oi", "volume"]]
+               .sum()
+               .rename(columns={"oi": "call_oi", "volume": "call_volume"})
+               .reset_index())
+    put_oi  = (df[df["type"] == "put"]
+               .groupby(["strike", "dte"])[["oi", "volume"]]
+               .sum()
+               .rename(columns={"oi": "put_oi", "volume": "put_volume"})
+               .reset_index())
+
+    return (a.merge(iv_pivot[["strike", "dte", "iv_call", "iv_put"]],
+                    on=["strike", "dte"], how="left")
+              .merge(call_oi, on=["strike", "dte"], how="left")
+              .merge(put_oi,  on=["strike", "dte"], how="left")
+              .fillna({"call_oi": 0, "put_oi": 0, "call_volume": 0, "put_volume": 0}))
 
 # ── Structural levels ──────────────────────────────────────────────────────────
 
@@ -183,6 +195,32 @@ def calc_atm_iv(df: pd.DataFrame, spot: float,
     front["dist"] = (front["strike"] - spot).abs()
     closest = front.nsmallest(1, "dist")
     return float(closest["iv"].values[0]) if not closest.empty else None
+
+
+def calc_iv_skew(df: pd.DataFrame, spot: float,
+                 target_dte: float = 30.0,
+                 band: float = 0.05) -> float | None:
+    """
+    Simplified risk-reversal skew at the expiry nearest to target_dte.
+    OTM put IV (band/2 to band below spot) minus OTM call IV (band/2 to band above spot).
+    Positive = put vol premium (normal). Near-zero or negative = unusual.
+    """
+    if df.empty:
+        return None
+    unique_dtes = df["dte"].unique()
+    best_dte    = unique_dtes[int(np.abs(unique_dtes - target_dte).argmin())]
+    exp         = df[df["dte"] == best_dte]
+
+    otm_puts  = exp[(exp["type"] == "put") &
+                    (exp["strike"] >= spot * (1 - band)) &
+                    (exp["strike"] <= spot * (1 - band / 2))]
+    otm_calls = exp[(exp["type"] == "call") &
+                    (exp["strike"] >= spot * (1 + band / 2)) &
+                    (exp["strike"] <= spot * (1 + band))]
+
+    if otm_puts.empty or otm_calls.empty:
+        return None
+    return float(otm_puts["iv"].mean() - otm_calls["iv"].mean())
 
 
 def calc_gex_regime(agg: pd.DataFrame, spot: float,

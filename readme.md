@@ -11,7 +11,7 @@ This is the data pipeline. The companion dashboard ([black-scholes-greeks-dashbo
 | File | Purpose |
 |---|---|
 | `collector.py` | Main collection loop — fetches SPY chain every 10 min during market hours, writes to SQLite |
-| `greeks.py` | Pure Black-Scholes math — `parse_chain`, `aggregate`, structural levels (GEX flip, walls, max pain, ATM IV) |
+| `greeks.py` | Pure Black-Scholes math — `parse_chain`, `aggregate`, structural levels (GEX flip, walls, max pain, ATM IV, IV skew) |
 | `auth.py` | Schwab OAuth handler — file-locked so the collector and dashboard can run simultaneously without token conflicts |
 | `test_collector.py` | Dry-run test — exercises every function against the live API without writing to the database |
 | `query-tool.py` | CLI utility for inspecting the database — available symbols, date ranges, latest summaries |
@@ -78,23 +78,31 @@ Three tables written on each collection cycle:
 | `dte` | Days to expiration |
 | `dte_bucket` | 0DTE / 1-7DTE / 8-30DTE / 31-90DTE / 91-180DTE / 180+DTE |
 | `GEX_call / GEX_put / GEX_net` | Gamma exposure by side and net |
-| `VannEX / VannEX_call / VannEX_put` | Vanna exposure by side and net |
-| `CharmEX / CharmEX_call / CharmEX_put` | Charm exposure by side and net |
-| `total_oi` | Open interest at that strike |
-| `total_volume` | Volume at that strike |
+| `VannEX_call / VannEX_put / VannEX` | Vanna exposure by side and net |
+| `CharmEX_call / CharmEX_put / CharmEX` | Charm exposure by side and net |
+| `total_oi / total_volume` | Aggregate open interest and volume at that strike |
+| `call_oi / put_oi` | Open interest split by side |
+| `call_volume / put_volume` | Volume split by side |
 | `iv_call / iv_put` | Implied volatility per side |
 
 **`summary`** — top-level market structure per symbol per timestamp.
 
 | Column | Description |
 |---|---|
-| `net_GEX / net_VannEX / net_CharmEX` | Aggregate exposure across all strikes |
+| `timestamp / symbol / spot` | When, what, and where |
 | `gamma_flip` | Strike where net GEX crosses zero |
 | `call_wall / put_wall` | Strikes with peak call and put GEX |
 | `max_pain` | Strike that minimizes total OI loss at expiration |
-| `iv_atm` | Front-month ATM implied volatility (closest expiry to 30 DTE) |
-| `gex_regime` | STRONG_POS / WEAK_POS / FLIP_ZONE / WEAK_NEG / STRONG_NEG |
-| `gex_0dte` through `gex_180plus` | Net GEX broken out by DTE bucket |
+| `iv_atm` | Front-month ATM implied volatility (nearest expiry to 30 DTE) |
+| `iv_skew` | Risk-reversal skew: OTM put IV minus OTM call IV at nearest 30 DTE expiry |
+| `gex_0dte` through `gex_180plus_dte` | Net GEX broken out by DTE bucket (6 columns) |
+| `vanna_0dte` through `vanna_180plus_dte` | Net VannEX broken out by DTE bucket (6 columns) |
+| `charm_0dte` through `charm_180plus_dte` | Net CharmEX broken out by DTE bucket (6 columns) |
+| `call_oi / put_oi` | Total open interest across all strikes, split by side |
+| `call_volume / put_volume` | Total volume across all strikes, split by side |
+| `spy_equity_volume` | SPY equity share volume from the quotes endpoint |
+| `realized_vol_5d` | 5-day close-to-close realized volatility, annualized |
+| `realized_vol_21d` | 21-day close-to-close realized volatility, annualized |
 
 **`macro_snapshot`** — TLT and VIX snapshot per timestamp.
 
