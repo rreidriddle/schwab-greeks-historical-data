@@ -62,8 +62,7 @@ def parse_chain(chain: dict,
         for exp_key, strikes in exp_map.items():
             try:    dte = float(exp_key.split(":")[1])
             except: continue
-            T = dte / 365
-            if T <= 0: continue
+            T = max(dte, 0.5) / 365
             bucket = get_dte_bucket(dte)
             for ks, contracts in strikes.items():
                 K = float(ks)
